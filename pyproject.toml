@@ -1,0 +1,13 @@
+[project]
+name = "toffice-agent"
+version = "0.1.0"
+description = "Claude Code-like agent using prompt-based tool use over OpenAI-compatible gateway API"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "rich>=13.0",
+    "prompt-toolkit>=3.0",
+]
+
+[project.scripts]
+toffice-agent = "toffice_agent.cli:main"
