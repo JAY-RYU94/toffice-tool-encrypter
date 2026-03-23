@@ -10,23 +10,48 @@ CLI 엔트리포인트.
 
 from __future__ import annotations
 
-import sys
-
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.text import Text
 
-from .agent import Agent
+from .agent import Agent, AgentInterrupted
 from .gateway_client import GatewayConfig
 from .parser import ParsedToolCall
 from .tools.executor import ToolResult
 
 console = Console()
 
+# 스트리밍 출력용 버퍼
+_stream_buf: list[str] = []
+_live: Live | None = None
+
+
+def _on_stream_chunk(chunk: str) -> None:
+    """스트리밍 청크를 실시간으로 표시합니다."""
+    global _live
+    _stream_buf.append(chunk)
+    text = "".join(_stream_buf)
+
+    if _live is None:
+        _live = Live(Markdown(text), console=console, refresh_per_second=8)
+        _live.start()
+    else:
+        _live.update(Markdown(text))
+
+
+def _flush_stream() -> None:
+    """스트리밍 버퍼를 정리합니다."""
+    global _live
+    if _live is not None:
+        _live.stop()
+        _live = None
+    _stream_buf.clear()
+
 
 def _on_tool_call(tc: ParsedToolCall) -> None:
     """Tool 실행 전 표시."""
+    _flush_stream()
     params_display = []
     for k, v in tc.params.items():
         display_val = repr(v[:120] + "...") if len(v) > 120 else repr(v)
@@ -53,13 +78,14 @@ def _on_tool_result(result: ToolResult) -> None:
 
 
 def _on_text(text: str) -> None:
-    """모델의 텍스트 응답 출력."""
+    """모델의 텍스트 응답 출력 (비스트리밍 모드용)."""
     console.print()
     console.print(Markdown(text))
 
 
 def _on_ask_user(question: str) -> str:
-    """ask_user 도구 콜백 - 사용자에게 질문을 보여주고 응답을 받음."""
+    """ask_user 도구 콜백 — 사용자에게 질문을 보여주고 응답을 받음."""
+    _flush_stream()
     console.print()
     console.print(
         Panel(
@@ -81,7 +107,7 @@ def main():
         Panel(
             f"Gateway: [cyan]{config.base_url}[/]\n"
             f"Model:   [cyan]{config.model}[/]\n\n"
-            f"Commands: [dim]exit, /reset[/]",
+            f"Commands: [dim]exit, /reset, /help[/]",
             title="toffice-agent",
             border_style="blue",
         )
@@ -89,8 +115,10 @@ def main():
 
     agent = Agent(
         config=config,
+        use_stream=True,
         on_tool_call=_on_tool_call,
         on_tool_result=_on_tool_result,
+        on_stream_chunk=_on_stream_chunk,
         on_text=_on_text,
         on_ask_user=_on_ask_user,
     )
@@ -105,15 +133,41 @@ def main():
 
         if not user_input:
             continue
-        if user_input.lower() in ("exit", "quit"):
+
+        cmd = user_input.lower()
+        if cmd in ("exit", "quit"):
             console.print("Bye!")
             break
-        if user_input.lower() == "/reset":
+        if cmd == "/reset":
             agent.reset()
             console.print("[dim]Conversation reset.[/]")
             continue
+        if cmd == "/help":
+            console.print(
+                Panel(
+                    "[bold]Commands:[/]\n"
+                    "  /reset  - Clear conversation history\n"
+                    "  /help   - Show this help\n"
+                    "  exit    - Quit\n\n"
+                    "[bold]Environment variables:[/]\n"
+                    "  GATEWAY_BASE_URL  - Gateway API endpoint\n"
+                    "  GATEWAY_API_KEY   - API key\n"
+                    "  GATEWAY_MODEL     - Model name\n"
+                    "  GATEWAY_MAX_TOKENS - Max response tokens",
+                    title="Help",
+                    border_style="blue",
+                )
+            )
+            continue
 
-        agent.run(user_input)
+        try:
+            agent.run(user_input)
+        except AgentInterrupted:
+            console.print("\n[yellow]Interrupted. You can continue or type a new request.[/]")
+        except Exception as e:
+            console.print(f"\n[red]Error: {e}[/]")
+        finally:
+            _flush_stream()
 
 
 if __name__ == "__main__":

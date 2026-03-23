@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .context import total_tokens, trim_messages
 from .gateway_client import GatewayClient, GatewayConfig
 from .parser import ParsedToolCall, parse_tool_calls, strip_tool_calls
 from .tools.definitions import BUILTIN_TOOLS, tools_to_system_prompt
@@ -46,6 +47,11 @@ When the user gives you a task, follow this workflow:
 """
 
 
+class AgentInterrupted(Exception):
+    """사용자가 Ctrl+C로 현재 작업을 중단했을 때."""
+    pass
+
+
 class Agent:
     """Prompt 기반 tool use 에이전트 (Claude Code 스타일)."""
 
@@ -54,14 +60,19 @@ class Agent:
         config: GatewayConfig | None = None,
         working_dir: str | None = None,
         max_iterations: int = 50,
+        max_context_tokens: int = 80_000,
+        use_stream: bool = True,
         on_tool_call: Callable[[ParsedToolCall], None] | None = None,
         on_tool_result: Callable[[ToolResult], None] | None = None,
+        on_stream_chunk: Callable[[str], None] | None = None,
         on_text: Callable[[str], None] | None = None,
         on_ask_user: Callable[[str], str] | None = None,
     ):
         self.client = GatewayClient(config)
         self.executor = ToolExecutor(working_dir)
         self.max_iterations = max_iterations
+        self.max_context_tokens = max_context_tokens
+        self.use_stream = use_stream
         self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tool_spec=tools_to_system_prompt(BUILTIN_TOOLS)
         )
@@ -70,64 +81,102 @@ class Agent:
         # 콜백
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
-        self.on_text = on_text
-        self.on_ask_user = on_ask_user  # ask_user 도구 호출 시 유저 입력을 받는 콜백
+        self.on_stream_chunk = on_stream_chunk  # 스트리밍 중 각 청크
+        self.on_text = on_text                  # 최종 텍스트 (스트리밍 미사용 시)
+        self.on_ask_user = on_ask_user
 
     def run(self, user_message: str) -> str:
         """사용자 메시지를 받아 에이전트 루프를 실행하고 최종 응답을 반환합니다."""
         self.messages.append({"role": "user", "content": user_message})
 
-        for _ in range(self.max_iterations):
-            response = self.client.chat(self.messages, system=self.system_prompt)
+        for iteration in range(self.max_iterations):
+            # 컨텍스트 윈도우 관리
+            self.messages = trim_messages(
+                self.messages,
+                max_tokens=self.max_context_tokens,
+            )
+
+            try:
+                response = self._get_response()
+            except KeyboardInterrupt:
+                raise AgentInterrupted()
+            except Exception as e:
+                error_msg = f"API error: {e}"
+                if self.on_text:
+                    self.on_text(error_msg)
+                return error_msg
+
             tool_calls = parse_tool_calls(response)
 
             if not tool_calls:
                 # 최종 응답
                 self.messages.append({"role": "assistant", "content": response})
-                if self.on_text:
+                # 스트리밍이 아닌 경우에만 on_text 호출 (스트리밍은 이미 출력됨)
+                if not self.use_stream and self.on_text:
                     self.on_text(response)
                 return response
 
             # tool call이 있는 경우
             self.messages.append({"role": "assistant", "content": response})
 
-            # 텍스트 부분이 있으면 출력
-            plain_text = strip_tool_calls(response)
-            if plain_text and self.on_text:
-                self.on_text(plain_text)
+            # 텍스트 부분이 있으면 출력 (스트리밍이 아닌 경우)
+            if not self.use_stream:
+                plain_text = strip_tool_calls(response)
+                if plain_text and self.on_text:
+                    self.on_text(plain_text)
 
             # 각 tool call 실행
             results: list[str] = []
-            for tc in tool_calls:
-                # ask_user는 특별 처리
-                if tc.name == "ask_user":
-                    result_text = self._handle_ask_user(tc)
+            try:
+                for tc in tool_calls:
+                    result_text = self._execute_tool(tc)
                     results.append(result_text)
-                    continue
+            except KeyboardInterrupt:
+                results.append("[Interrupted by user]")
+                raise AgentInterrupted()
 
-                if self.on_tool_call:
-                    self.on_tool_call(tc)
-
-                result = self.executor.execute(
-                    ToolCall(name=tc.name, params=tc.params)
-                )
-                if self.on_tool_result:
-                    self.on_tool_result(result)
-
-                status = "success" if result.success else "error"
-                results.append(
-                    f"<tool_result name=\"{tc.name}\" status=\"{status}\">\n"
-                    f"{result.output}\n"
-                    f"</tool_result>"
-                )
-
-            # tool 결과를 user 메시지로 추가
+            # tool 결과를 별도 역할 표시와 함께 추가
+            tool_output = "\n\n".join(results)
             self.messages.append({
                 "role": "user",
-                "content": "\n\n".join(results),
+                "content": f"[Tool execution results - not from the user]\n\n{tool_output}",
             })
 
         return "Error: max iterations reached."
+
+    def _get_response(self) -> str:
+        """스트리밍 여부에 따라 응답을 받습니다."""
+        if self.use_stream:
+            chunks: list[str] = []
+            for chunk in self.client.chat_stream(self.messages, system=self.system_prompt):
+                chunks.append(chunk)
+                if self.on_stream_chunk:
+                    self.on_stream_chunk(chunk)
+            return "".join(chunks)
+        else:
+            return self.client.chat(self.messages, system=self.system_prompt)
+
+    def _execute_tool(self, tc: ParsedToolCall) -> str:
+        """단일 tool call을 실행하고 결과 XML을 반환합니다."""
+        # ask_user는 특별 처리
+        if tc.name == "ask_user":
+            return self._handle_ask_user(tc)
+
+        if self.on_tool_call:
+            self.on_tool_call(tc)
+
+        result = self.executor.execute(
+            ToolCall(name=tc.name, params=tc.params)
+        )
+        if self.on_tool_result:
+            self.on_tool_result(result)
+
+        status = "success" if result.success else "error"
+        return (
+            f"<tool_result name=\"{tc.name}\" status=\"{status}\">\n"
+            f"{result.output}\n"
+            f"</tool_result>"
+        )
 
     def _handle_ask_user(self, tc: ParsedToolCall) -> str:
         """ask_user 도구를 처리합니다."""

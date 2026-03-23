@@ -8,11 +8,15 @@ Tool 정의는 system prompt에 포함되어 모델이 XML로 tool call을 출�
 
 from __future__ import annotations
 
+import logging
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from typing import Any, Generator
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,6 +37,12 @@ class GatewayConfig:
         )
 
 
+# 재시도 가능한 에러 타입
+_RETRYABLE = (APIConnectionError, APITimeoutError, RateLimitError)
+_MAX_RETRIES = 3
+_RETRY_DELAYS = [2, 4, 8]
+
+
 class GatewayClient:
     """OpenAI 호환 게이트웨이 클라이언트. tools 파라미터 없이 동작."""
 
@@ -41,6 +51,7 @@ class GatewayClient:
         self._client = OpenAI(
             base_url=self.config.base_url,
             api_key=self.config.api_key,
+            timeout=120.0,
         )
 
     def chat(
@@ -48,18 +59,9 @@ class GatewayClient:
         messages: list[dict[str, Any]],
         system: str = "",
     ) -> str:
-        """
-        게이트웨이로 메시지를 보내고 응답 텍스트를 반환합니다.
-        tools 파라미터 없이 순수 텍스트 요청만 사용합니다.
-        """
+        """동기 응답. 전체 텍스트를 한번에 반환합니다."""
         full_messages = self._build_messages(messages, system)
-
-        # tools 파라미터는 의도적으로 포함하지 않음
-        resp = self._client.chat.completions.create(
-            model=self.config.model,
-            messages=full_messages,
-            max_tokens=self.config.max_tokens,
-        )
+        resp = self._call_with_retry(full_messages, stream=False)
         return resp.choices[0].message.content or ""
 
     def chat_stream(
@@ -69,17 +71,34 @@ class GatewayClient:
     ) -> Generator[str, None, None]:
         """스트리밍 응답. 각 청크의 텍스트를 yield합니다."""
         full_messages = self._build_messages(messages, system)
-
-        stream = self._client.chat.completions.create(
-            model=self.config.model,
-            messages=full_messages,
-            max_tokens=self.config.max_tokens,
-            stream=True,
-        )
+        stream = self._call_with_retry(full_messages, stream=True)
         for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
                 yield delta.content
+
+    def _call_with_retry(self, messages: list[dict[str, Any]], stream: bool):
+        """재시도 로직 포함 API 호출."""
+        last_error = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return self._client.chat.completions.create(
+                    model=self.config.model,
+                    messages=messages,
+                    max_tokens=self.config.max_tokens,
+                    stream=stream,
+                )
+            except _RETRYABLE as e:
+                last_error = e
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[attempt]
+                    logger.warning(f"API error (attempt {attempt + 1}): {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+            except KeyboardInterrupt:
+                raise
+        raise last_error  # type: ignore[misc]
 
     @staticmethod
     def _build_messages(
