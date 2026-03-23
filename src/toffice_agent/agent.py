@@ -126,21 +126,34 @@ class Agent:
                     self.on_text(plain_text)
 
             # 각 tool call 실행
-            results: list[str] = []
+            tool_results: list[str] = []
+            user_replies: list[str] = []
             try:
                 for tc in tool_calls:
-                    result_text = self._execute_tool(tc)
-                    results.append(result_text)
+                    if tc.name == "ask_user":
+                        reply_text = self._handle_ask_user(tc)
+                        user_replies.append(reply_text)
+                    else:
+                        result_text = self._execute_tool(tc)
+                        tool_results.append(result_text)
             except KeyboardInterrupt:
-                results.append("[Interrupted by user]")
+                tool_results.append("[Interrupted by user]")
                 raise AgentInterrupted()
 
-            # tool 결과를 별도 역할 표시와 함께 추가
-            tool_output = "\n\n".join(results)
-            self.messages.append({
-                "role": "user",
-                "content": f"[Tool execution results - not from the user]\n\n{tool_output}",
-            })
+            # tool 결과는 시스템 메시지로 추가 (사용자 발화가 아님을 명시)
+            if tool_results:
+                tool_output = "\n\n".join(tool_results)
+                self.messages.append({
+                    "role": "user",
+                    "content": f"[Tool execution results - not from the user]\n\n{tool_output}",
+                })
+
+            # ask_user 응답은 실제 사용자 발화이므로 별도 user 메시지로
+            if user_replies:
+                self.messages.append({
+                    "role": "user",
+                    "content": "\n\n".join(user_replies),
+                })
 
         return "Error: max iterations reached."
 
@@ -158,10 +171,6 @@ class Agent:
 
     def _execute_tool(self, tc: ParsedToolCall) -> str:
         """단일 tool call을 실행하고 결과 XML을 반환합니다."""
-        # ask_user는 특별 처리
-        if tc.name == "ask_user":
-            return self._handle_ask_user(tc)
-
         if self.on_tool_call:
             self.on_tool_call(tc)
 
@@ -179,17 +188,13 @@ class Agent:
         )
 
     def _handle_ask_user(self, tc: ParsedToolCall) -> str:
-        """ask_user 도구를 처리합니다."""
+        """ask_user 도구를 처리합니다. 사용자의 실제 응답을 반환합니다."""
         question = tc.params.get("question", "")
         if self.on_ask_user:
             user_reply = self.on_ask_user(question)
         else:
             user_reply = input(f"\n{question}\n> ")
-        return (
-            f"<tool_result name=\"ask_user\" status=\"success\">\n"
-            f"User response: {user_reply}\n"
-            f"</tool_result>"
-        )
+        return user_reply
 
     def reset(self):
         """대화 기록을 초기화합니다."""

@@ -46,10 +46,31 @@ class ToolExecutor:
 
     # ─── Tool 구현 ───
 
+    # 위험한 패턴 — 실행 전 경고를 포함하여 반환
+    _DANGEROUS_PATTERNS = [
+        (r"\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|)(/|~|\$HOME)", "rm on system/home directory"),
+        (r"\bmkfs\b", "filesystem format"),
+        (r"\bdd\s+.*of\s*=\s*/dev/", "raw device write"),
+        (r">\s*/dev/sd[a-z]", "raw device overwrite"),
+        (r"\bcurl\b.*\|\s*(ba)?sh", "pipe remote script to shell"),
+        (r"\bwget\b.*\|\s*(ba)?sh", "pipe remote script to shell"),
+        (r":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;", "fork bomb"),
+    ]
+
     def _tool_bash(self, params: dict[str, str]) -> str:
         command = params.get("command", "")
         if not command:
             return "Error: command is required"
+
+        # 위험 명령 패턴 검사
+        for pattern, reason in self._DANGEROUS_PATTERNS:
+            if re.search(pattern, command):
+                return (
+                    f"Error: potentially dangerous command blocked ({reason}).\n"
+                    f"Command: {command}\n"
+                    f"If you need to run this, ask the user for confirmation first via ask_user."
+                )
+
         result = subprocess.run(
             command,
             shell=True,
